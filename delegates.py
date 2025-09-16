@@ -24,8 +24,12 @@ class ButtonDelegate(QStyledItemDelegate):
             is_enabled = keybind.is_bound
         # Column 3 is "Reset"
         elif index.column() == 3:
-            default_key = model.sourceModel().get_default_key(keybind.action)
-            is_enabled = keybind.is_changed or (default_key and keybind.key.lower() != default_key.lower())
+            src = model.sourceModel()
+            default_key = src.get_default_key(keybind.action)
+            # Enable if different from original OR differs from any default in normalized form
+            is_enabled = keybind.is_changed or (
+                default_key is not None and not src.is_default_match(keybind.action, keybind.key)
+            )
 
         button.setEnabled(is_enabled)
 

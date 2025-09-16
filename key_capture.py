@@ -1,5 +1,5 @@
 # key_capture.py
-from PyQt6.QtWidgets import QDialog, QLabel, QVBoxLayout
+from PyQt6.QtWidgets import QDialog, QLabel, QVBoxLayout, QCheckBox
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QKeyEvent
 
@@ -10,7 +10,6 @@ class KeyCaptureDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Capture Keybind")
         self.setMinimumSize(300, 100)
-
         self.info_label = QLabel("Press keys… (multi-tap supported)")
         self.info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         font = self.info_label.font()
@@ -19,6 +18,8 @@ class KeyCaptureDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.addWidget(self.info_label)
+        self.any_checkbox = QCheckBox("Use Any (ignore extra modifiers)")
+        layout.addWidget(self.any_checkbox)
 
         self.sequence_parts = []
         self.timer = QTimer(self)
@@ -26,12 +27,24 @@ class KeyCaptureDialog(QDialog):
         self.timer.setInterval(450) # Multi-tap timeout
         self.timer.timeout.connect(self.finalize_sequence)
 
+        # Track last seen modifiers to allow '<mods>+any' capture
+        self._last_mods = Qt.KeyboardModifier.NoModifier
+
     def keyPressEvent(self, event: QKeyEvent):
+        self._last_mods = event.modifiers()
         key_text = self.format_key_event(event)
         if key_text:
             self.sequence_parts.append(key_text)
             self.info_label.setText(",".join(self.sequence_parts))
             self.timer.start()
+        else:
+            # For pure modifiers without Any-mode, ignore
+            if event.key() in (Qt.Key.Key_Control, Qt.Key.Key_Shift, Qt.Key.Key_Alt, Qt.Key.Key_Meta):
+                return
+
+    def keyReleaseEvent(self, event: QKeyEvent):
+        # No special handling needed; we only capture on keyPress
+        pass
 
     def finalize_sequence(self):
         if self.sequence_parts:
@@ -43,16 +56,29 @@ class KeyCaptureDialog(QDialog):
         mods = event.modifiers()
         text = event.text()
 
-        # Ignore pure modifier presses
+        any_mode = self.any_checkbox.isChecked()
+        # Pure modifier key
         if key in (Qt.Key.Key_Control, Qt.Key.Key_Shift, Qt.Key.Key_Alt, Qt.Key.Key_Meta):
+            if any_mode:
+                # Allow binding like 'Any+shift', 'Any+ctrl', 'Any+alt'
+                if key == Qt.Key.Key_Control:
+                    return "Any+ctrl"
+                if key == Qt.Key.Key_Shift:
+                    return "Any+shift"
+                if key == Qt.Key.Key_Alt:
+                    return "Any+alt"
+                # Meta is rarely used in BAR; skip
+                return None
             return None
 
-        mod_list = []
-        if mods & Qt.KeyboardModifier.ControlModifier: mod_list.append("Ctrl")
-        if mods & Qt.KeyboardModifier.ShiftModifier: mod_list.append("Shift")
-        if mods & Qt.KeyboardModifier.AltModifier: mod_list.append("Alt")
-        
-        prefix = "+".join(mod_list) + ("+" if mod_list else "")
+        if any_mode:
+            prefix = "Any+"
+        else:
+            mod_list = []
+            if mods & Qt.KeyboardModifier.ControlModifier: mod_list.append("Ctrl")
+            if mods & Qt.KeyboardModifier.ShiftModifier: mod_list.append("Shift")
+            if mods & Qt.KeyboardModifier.AltModifier: mod_list.append("Alt")
+            prefix = "+".join(mod_list) + ("+" if mod_list else "")
 
         # Special keys mapping
         key_map = {
@@ -79,5 +105,4 @@ class KeyCaptureDialog(QDialog):
             return f"{prefix}sc_{text.lower()}"
         if text and text.isprintable():
             return f"{prefix}{text}"
-
         return None
