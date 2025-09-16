@@ -9,7 +9,7 @@ If you're missing commands, the program parses commands from the (default keys.t
 - To run the app, just run the .exe like any normal program if you download it from the releases page.
 
 # Disclaimer
-- I do not intend to maintain this at all. It is mostly just for convenience for my friends and I, since chaning keybinds is quite a hassle currently.
+- I do not intend to maintain this at all. It is mostly just for convenience for my friends and I, since changing keybinds is quite a hassle currently.
 
 ## Quick Start (Windows)
 - Install Python and dependencies:
