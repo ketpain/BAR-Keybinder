@@ -54,6 +54,21 @@
 			],
 			"isBackground": false,
 			"group": "build"
+		},
+		{
+			"label": "Run BAR-Keybinder main.py",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"-X",
+				"faulthandler",
+				".\\main.py"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$eslint-stylish"
+			],
+			"group": "build"
 		}
 	]
 }

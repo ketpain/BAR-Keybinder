@@ -15,7 +15,7 @@ class KeybindEditorApp(ctk.CTk):
 
         # --- Window Setup ---
         self.title("BAR Keybind Editor")
-        self.geometry("800x600")
+        self.geometry("1000x1024")
 
         # --- Data Storage ---
         # This list will hold our parsed keybind data.
@@ -24,6 +24,8 @@ class KeybindEditorApp(ctk.CTk):
         # This dictionary will link a specific keybind's data to its UI entry widget
         self.ui_widgets = {}
         self.filename = r"C:\\Program Files\\Beyond-All-Reason\\data\\uikeys.txt"
+        # Optional defaults file bundled next to this script
+        self.defaults_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "original keys.txt")
 
         # --- Runtime State ---
         self.listening_entry = None
@@ -31,6 +33,11 @@ class KeybindEditorApp(ctk.CTk):
         self.saw_alt_press = False
         self.saw_any_nonmod_key = False
         self.DEBUG = False  # set True to print key event debug info
+        self.show_only_unbound = ctk.BooleanVar(value=False)
+        self.show_only_changed = ctk.BooleanVar(value=False)
+        self.sort_mode = ctk.StringVar(value="Original")
+        # Defaults: action -> [keys] from original keys file
+        self.default_action_to_keys = {}
 
         # --- UI Layout ---
         # Configure the grid layout (2 rows, 1 column)
@@ -50,9 +57,64 @@ class KeybindEditorApp(ctk.CTk):
         self.load_button = ctk.CTkButton(self.top_frame, text="Load / Reload", command=self.load_and_display_keybinds)
         self.load_button.pack(side="right", padx=10)
 
+        self.unbound_only_check = ctk.CTkCheckBox(
+            self.top_frame,
+            text="Show unbound only",
+            variable=self.show_only_unbound,
+            command=self.on_toggle_unbound_only,
+        )
+        self.unbound_only_check.pack(side="right", padx=10)
+
+        self.changed_only_check = ctk.CTkCheckBox(
+            self.top_frame,
+            text="Show changed only",
+            variable=self.show_only_changed,
+            command=self.on_toggle_changed_only,
+        )
+        self.changed_only_check.pack(side="right", padx=10)
+
+        self.sort_menu = ctk.CTkOptionMenu(
+            self.top_frame,
+            values=["Original", "Unbound first", "Action A→Z"],
+            variable=self.sort_mode,
+            command=lambda _: self.on_change_sort(),
+        )
+        self.sort_menu.set("Original")
+        self.sort_menu.pack(side="right", padx=10)
+
         # --- Main Scrollable Frame for Keybinds ---
         self.scrollable_frame = ctk.CTkScrollableFrame(self, label_text="Keybinds")
         self.scrollable_frame.grid(row=1, column=0, padx=10, pady=(0, 10), sticky="nsew")
+
+        # Inner content frame to host rows; we control its width to avoid
+        # continuous reflow while the window is being resized.
+        self.content_frame = ctk.CTkFrame(self.scrollable_frame)
+        self.content_frame.pack(anchor="nw")  # width managed explicitly
+        self.content_frame.pack_propagate(False)
+
+        # Grid config for rows: column 0 stretches (action), column 1 fixed (entry), columns 2-3 buttons
+        self.content_frame.grid_columnconfigure(0, weight=1)
+        self.content_frame.grid_columnconfigure(1, weight=0)
+        self.content_frame.grid_columnconfigure(2, weight=0)
+        self.content_frame.grid_columnconfigure(3, weight=0)
+
+        # Debounced resize handler state
+        self._resize_after_id = None
+        self.bind("<Configure>", self._on_configure)
+
+        # Initialize content width after first layout
+        self.after(0, self._init_content_width)
+
+        # Batched UI build settings/state
+        self._build_batch_size = 80
+        self._build_ctx = None  # holds: {frame, index, row_index}
+        self._build_after_id = None
+        # Multi-tap capture state
+        self.sequence_parts = None
+        self.sequence_after_id = None
+        self.sequence_timeout_ms = 450
+        # Track per-row reset buttons for inline updates
+        self.reset_buttons = {}
 
         # --- Initial Load ---
         self.load_and_display_keybinds()
@@ -87,10 +149,13 @@ class KeybindEditorApp(ctk.CTk):
     def load_and_display_keybinds(self):
         """Loads the keybinds file, parses it, and populates the UI."""
         # Clear any existing data and widgets
+        self._cancel_batched_build()
         self.keybind_data.clear()
         self.ui_widgets.clear()
-        for widget in self.scrollable_frame.winfo_children():
-            widget.destroy()
+        # Clear previous UI rows
+        if hasattr(self, "content_frame") and self.content_frame is not None:
+            for widget in self.content_frame.winfo_children():
+                widget.destroy()
 
         if not self.filename or not os.path.exists(self.filename):
             initial_dir = os.path.dirname(self.filename) if self.filename else r"C:\\Program Files\\Beyond-All-Reason\\data"
@@ -116,51 +181,413 @@ class KeybindEditorApp(ctk.CTk):
             for i, line in enumerate(lines):
                 parsed = self.parse_line(line)
                 # We use the line number (i) as a unique ID
-                parsed['id'] = i 
+                parsed['id'] = i
+                if parsed.get("type") == "bind":
+                    # Snapshot the original key for change detection
+                    parsed['original_key'] = parsed.get('key', '')
                 self.keybind_data.append(parsed)
 
-            # Now, create the UI elements based on the parsed data
-            self.populate_ui()
+            # If a defaults file exists, merge in any missing actions as synthetic "unbound" rows
+            try:
+                default_actions = self._load_default_actions()
+            except Exception:
+                default_actions = set()
+            if default_actions:
+                existing_actions = {item.get("action") for item in self.keybind_data if item.get("type") == "bind"}
+                missing_actions = [a for a in default_actions if a not in existing_actions]
+                # Ensure unique IDs continue from the max existing id
+                next_id = (max((it.get('id', -1) for it in self.keybind_data), default=-1) + 1) if self.keybind_data else 0
+                for action in sorted(missing_actions):
+                    self.keybind_data.append({
+                        "type": "bind",
+                        "key": "unbound",
+                        "action": action,
+                        "original": None,
+                        "id": next_id,
+                        "original_key": None,
+                        "synthetic": True,
+                    })
+                    next_id += 1
+
+            # Now, create the UI elements based on the parsed data in batches
+            self.start_populating_ui()
             
         except Exception as e:
             messagebox.showerror("Error Loading File", f"An error occurred: {e}")
 
-    def populate_ui(self):
-        """Creates and displays the UI widgets for each keybind."""
-        for item in self.keybind_data:
-            if item["type"] == "bind":
-                # Create a frame for each row to hold the label and entry
-                row_frame = ctk.CTkFrame(self.scrollable_frame)
-                row_frame.pack(fill="x", padx=5, pady=2)
+    def _load_default_actions(self):
+        """Parse `original keys.txt` (if present) and return a set of action strings.
 
-                # The action is on the left
-                action_label = ctk.CTkLabel(row_frame, text=item["action"], anchor="w")
-                action_label.pack(side="left", fill="x", expand=True, padx=10)
+        The defaults file should be placed alongside this script. Only `bind` lines
+        are considered; non-bind lines are ignored. Duplicate actions are reduced
+        to a single representative action string.
+        """
+        actions = set()
+        self.default_action_to_keys = {}
+        if not self.defaults_path or not os.path.exists(self.defaults_path):
+            return actions
+        with open(self.defaults_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                parsed = self.parse_line(line)
+                if parsed.get("type") == "bind":
+                    act = parsed.get("action")
+                    key = parsed.get("key")
+                    if act:
+                        actions.add(act)
+                        if key:
+                            self.default_action_to_keys.setdefault(act, []).append(key)
+        return actions
 
-                # The key entry field is on the right
-                key_entry = ctk.CTkEntry(row_frame, width=200, placeholder_text="Click and press a key")
-                key_entry.insert(0, item["key"])
-                key_entry.pack(side="right", padx=10)
+    def _default_key_for_action(self, action: str):
+        """Return the first default key for a given action, if any."""
+        if not action:
+            return None
+        keys = self.default_action_to_keys.get(action)
+        if keys:
+            return keys[0]
+        return None
 
-                # Store the entry widget using the unique ID so we can retrieve its value later
+    def start_populating_ui(self):
+        """Start building UI rows in batches on a hidden frame, then swap in."""
+        self._cancel_batched_build()
+        # Sync UI edits back to data so toggling filters won't discard unsaved text
+        self._sync_ui_to_data()
+        # Clear button mapping; will be rebuilt
+        self.reset_buttons.clear()
+        # Build filtered/sorted item list
+        items = [it for it in self.keybind_data if it.get("type") == "bind"]
+        # Apply filters
+        if self.show_only_unbound.get():
+            items = [it for it in items if (it.get("key", "") or "").strip().lower() in ("", "unbound")]
+        if self.show_only_changed.get():
+            items = [it for it in items if self._is_changed(it)]
+        # Apply sort
+        mode = (self.sort_mode.get() or "Original").lower()
+        if mode.startswith("unbound"):
+            def sort_key(it):
+                k = (it.get("key", "") or "").strip().lower()
+                is_unbound = 0 if k in ("", "unbound") else 1
+                return (is_unbound, (it.get("action") or "").lower(), it.get("id", 0))
+            items.sort(key=sort_key)
+        elif mode.startswith("action"):
+            items.sort(key=lambda it: ((it.get("action") or "").lower(), it.get("id", 0)))
+        else:
+            items.sort(key=lambda it: it.get("id", 0))
+        # Create a new hidden frame to build rows off-screen
+        new_frame = ctk.CTkFrame(self.scrollable_frame)
+        new_frame.grid_columnconfigure(0, weight=1)
+        new_frame.grid_columnconfigure(1, weight=0)
+        # Reset UI mapping
+        self.ui_widgets.clear()
+        # Initialize batch context
+        self._build_ctx = {
+            "frame": new_frame,
+            "index": 0,
+            "row_index": 0,
+            "items": items,
+        }
+        # Disable save button while building to avoid partial reads
+        try:
+            self.save_button.configure(state="disabled")
+        except Exception:
+            pass
+        # Kick off batched building
+        self._build_after_id = self.after(1, self._populate_ui_batch)
+
+    def _populate_ui_batch(self):
+        ctx = self._build_ctx
+        if not ctx:
+            return
+        frame = ctx["frame"]
+        i = ctx["index"]
+        row_index = ctx["row_index"]
+        items = ctx.get("items", [])
+        n = len(items)
+        limit = min(i + self._build_batch_size, n)
+
+        while i < limit:
+            item = items[i]
+            if item.get("type") == "bind":
+                # Apply filter if enabled: only show rows whose key is empty or 'unbound'
+                action_label = ctk.CTkLabel(frame, text=item.get("action", ""), anchor="w")
+                action_label.grid(row=row_index, column=0, sticky="ew", padx=10, pady=2)
+
+                key_entry = ctk.CTkEntry(
+                    frame,
+                    width=220,
+                    placeholder_text="Click and press a key (or type e.g., 1,1)",
+                )
+                key_text = item.get("key", "") or ""
+                key_entry.insert(0, key_text)
+                key_entry.grid(row=row_index, column=1, sticky="e", padx=10, pady=2)
+                # Prevent free editing; enable only while listening
+                try:
+                    key_entry.configure(state="disabled")
+                except Exception:
+                    pass
+
                 self.ui_widgets[item["id"]] = key_entry
-
-                # Bind click/focus to start listening for a key press for this entry
                 key_entry.bind("<Button-1>", lambda e, entry=key_entry: self.start_listening(entry))
+
+                # Unbind button for this row
+                unbind_btn = ctk.CTkButton(
+                    frame,
+                    text="Unbind",
+                    width=70,
+                    command=lambda entry=key_entry, it=item: self._unbind_row(entry, it),
+                )
+                unbind_btn.grid(row=row_index, column=2, sticky="e", padx=(0, 6), pady=2)
+
+                # Reset button if changed or a default is known
+                default_key = self._default_key_for_action(item.get("action"))
+                cur_key_norm = (item.get("key", "") or "").strip().lower()
+                def_norm = (default_key or "").strip().lower()
+                show_reset = self._is_changed(item) or (default_key is not None and cur_key_norm != def_norm)
+                if show_reset:
+                    reset_btn = ctk.CTkButton(
+                        frame,
+                        text="Reset",
+                        width=70,
+                        command=lambda entry=key_entry, it=item: self._reset_row(entry, it),
+                    )
+                    reset_btn.grid(row=row_index, column=3, sticky="e", padx=(0, 10), pady=2)
+                    self.reset_buttons[item["id"]] = reset_btn
+                else:
+                    # Ensure no stale mapping
+                    self.reset_buttons.pop(item["id"], None)
+                row_index += 1
+            i += 1
+
+        # Save progress
+        ctx["index"] = i
+        ctx["row_index"] = row_index
+
+        if i < n:
+            # Schedule next batch
+            self._build_after_id = self.after(1, self._populate_ui_batch)
+        else:
+            # Finished: swap frames in and finalize layout
+            try:
+                # Remove old content frame
+                if self.content_frame and self.content_frame.winfo_exists():
+                    self.content_frame.destroy()
+            except Exception:
+                pass
+            self.content_frame = frame
+            self.content_frame.pack(anchor="nw")
+            self.content_frame.pack_propagate(False)
+            self._build_ctx = None
+            # Re-enable save button now that UI is ready
+            try:
+                self.save_button.configure(state="normal")
+            except Exception:
+                pass
+            # Apply width once after full build
+            self.after(0, self._apply_content_width)
+
+    def _sync_ui_to_data(self):
+        """Update self.keybind_data['key'] values from current UI entries if present."""
+        if not self.ui_widgets:
+            return
+        for item in self.keybind_data:
+            if item.get("type") != "bind":
+                continue
+            entry_widget = self.ui_widgets.get(item.get("id"))
+            if entry_widget:
+                try:
+                    item["key"] = (entry_widget.get() or "").strip()
+                except Exception:
+                    pass
+
+    def on_toggle_unbound_only(self):
+        # Rebuild UI with updated filter, keeping unsaved edits via sync
+        self.start_populating_ui()
+
+    def on_toggle_changed_only(self):
+        self.start_populating_ui()
+
+    def on_change_sort(self):
+        self.start_populating_ui()
+
+    def _is_changed(self, item: dict) -> bool:
+        if item.get("type") != "bind":
+            return False
+        cur = (item.get("key", "") or "").strip().lower()
+        orig = item.get("original_key")
+        if orig is None:
+            # Synthetic default: treated as changed only if user bound it
+            return cur not in ("", "unbound")
+        return cur != (orig or "").strip().lower()
+
+    def _unbind_row(self, entry, item):
+        prev_state = None
+        try:
+            prev_state = entry.cget("state")
+            entry.configure(state="normal")
+        except Exception:
+            pass
+        try:
+            entry.delete(0, "end")
+        except Exception:
+            pass
+        try:
+            entry.insert(0, "unbound")
+        except Exception:
+            pass
+        try:
+            if prev_state:
+                entry.configure(state=prev_state)
+        except Exception:
+            pass
+        item["key"] = "unbound"
+        # Update UI so Reset button reflects immediately without full rebuild
+        self._maybe_refresh_after_row_change(item=item, entry=entry)
+
+    def _reset_row(self, entry, item):
+        orig = (item.get("original_key") or "").strip()
+        if not orig:
+            # For synthetic or missing original, try default
+            orig = (self._default_key_for_action(item.get("action")) or "").strip()
+        prev_state = None
+        try:
+            prev_state = entry.cget("state")
+            entry.configure(state="normal")
+        except Exception:
+            pass
+        try:
+            entry.delete(0, "end")
+        except Exception:
+            pass
+        try:
+            entry.insert(0, orig)
+        except Exception:
+            pass
+        try:
+            if prev_state:
+                entry.configure(state=prev_state)
+        except Exception:
+            pass
+        item["key"] = orig
+        # Update UI so Reset button visibility/state reflects immediately
+        self._maybe_refresh_after_row_change(item=item, entry=entry)
+
+    def _maybe_refresh_after_row_change(self, item=None, entry=None):
+        """Rebuild the UI when filters/sort demand it; otherwise update this row inline."""
+        try:
+            needs_rebuild = (
+                self.show_only_unbound.get()
+                or self.show_only_changed.get()
+                or (self.sort_mode.get() or "Original") != "Original"
+            )
+        except Exception:
+            needs_rebuild = True
+        if needs_rebuild:
+            self.start_populating_ui()
+            return
+        # Inline update of Reset button for the affected row
+        if item is not None and entry is not None:
+            self._update_row_buttons(entry, item)
+
+    def _update_row_buttons(self, entry, item):
+        """Ensure the Reset button for this row is shown/hidden based on current state."""
+        try:
+            parent = entry.master
+            info = entry.grid_info()
+            row_index = int(info.get("row", 0))
+        except Exception:
+            return
+
+        default_key = self._default_key_for_action(item.get("action"))
+        cur_key_norm = (item.get("key", "") or "").strip().lower()
+        def_norm = (default_key or "").strip().lower()
+        show_reset = self._is_changed(item) or (default_key is not None and cur_key_norm != def_norm)
+
+        # Existing reset widget if any
+        existing = self.reset_buttons.get(item.get("id"))
+        if show_reset:
+            if existing and getattr(existing, "winfo_exists", lambda: False)():
+                # Ensure it's gridded in the right spot
+                try:
+                    existing.grid(row=row_index, column=3, sticky="e", padx=(0, 10), pady=2)
+                except Exception:
+                    pass
+            else:
+                try:
+                    reset_btn = ctk.CTkButton(
+                        parent,
+                        text="Reset",
+                        width=70,
+                        command=lambda entry=entry, it=item: self._reset_row(entry, it),
+                    )
+                    reset_btn.grid(row=row_index, column=3, sticky="e", padx=(0, 10), pady=2)
+                    self.reset_buttons[item["id"]] = reset_btn
+                except Exception:
+                    pass
+        else:
+            # Hide/destroy if present
+            if existing and getattr(existing, "winfo_exists", lambda: False)():
+                try:
+                    existing.destroy()
+                except Exception:
+                    pass
+            self.reset_buttons.pop(item.get("id"), None)
+
+    def _cancel_batched_build(self):
+        try:
+            if self._build_after_id is not None:
+                self.after_cancel(self._build_after_id)
+        except Exception:
+            pass
+        self._build_after_id = None
+        self._build_ctx = None
+
+    # ---- Resize handling / layout throttling ----
+    def _init_content_width(self):
+        self._apply_content_width()
+
+    def _on_configure(self, event):
+        # Debounce layout updates to avoid heavy recalcs during live drag
+        if event.widget is self:
+            if self._resize_after_id is not None:
+                try:
+                    self.after_cancel(self._resize_after_id)
+                except Exception:
+                    pass
+            self._resize_after_id = self.after(400, self._apply_content_width)
+
+    def _apply_content_width(self):
+        self._resize_after_id = None
+        try:
+            # Use the inner area width of the scrollable frame if available
+            target_width = max(200, int(self.scrollable_frame.winfo_width()) - 20)
+        except Exception:
+            target_width = 600
+        try:
+            self.content_frame.configure(width=target_width)
+        except Exception:
+            pass
 
     # ---- Key Capture Logic ----
     def start_listening(self, entry):
         # Enter listening mode for this entry; capture the very next keypress anywhere in the app
         self.listening_entry = entry
+        # Enable editing while listening
+        try:
+            entry.configure(state="normal")
+        except Exception:
+            pass
         try:
             entry.delete(0, "end")
         except Exception:
             pass
-        entry.insert(0, "Press any key…")
+        entry.insert(0, "Press keys… (multi-tap supported)")
         # Reset tracked modifiers
         self.active_mods.clear()
         self.saw_alt_press = False
         self.saw_any_nonmod_key = False
+        # Prepare multi-tap state
+        self._reset_sequence_timer()
+        self.sequence_parts = []
         # Bind globally so we catch keys even if the Entry loses focus momentarily
         self.bind_all("<KeyPress>", self.on_key_press)
         # Explicitly bind KeyPress while modifiers are held to ensure delivery on some Tk/Windows paths
@@ -193,6 +620,7 @@ class KeybindEditorApp(ctk.CTk):
 
     def end_listening(self):
         # Stop capturing keys
+        entry = self.listening_entry
         try:
             self.unbind_all("<KeyPress>")
         except Exception:
@@ -213,10 +641,18 @@ class KeybindEditorApp(ctk.CTk):
                 self.unbind_all(seq)
             except Exception:
                 pass
+        # Disable editing after listening ends
+        if entry is not None:
+            try:
+                entry.configure(state="disabled")
+            except Exception:
+                pass
         self.listening_entry = None
         self.active_mods.clear()
         self.saw_alt_press = False
         self.saw_any_nonmod_key = False
+        self._reset_sequence_timer()
+        self.sequence_parts = None
 
     def on_key_press(self, event):
         # Only handle when we're in listening mode
@@ -233,6 +669,20 @@ class KeybindEditorApp(ctk.CTk):
             # If unmapped, just ignore and keep listening
             return "break"
 
+        # Multi-tap: accumulate within timeout
+        if self.sequence_parts is not None:
+            self.sequence_parts.append(key_text)
+            seq_text = ",".join(self.sequence_parts)
+            entry = self.listening_entry
+            try:
+                entry.delete(0, "end")
+            except Exception:
+                pass
+            entry.insert(0, seq_text)
+            self._reset_sequence_timer()
+            self.sequence_after_id = self.after(self.sequence_timeout_ms, self._finalize_sequence)
+            return "break"
+
         # Update the entry with the mapped key text
         entry = self.listening_entry
         try:
@@ -244,40 +694,41 @@ class KeybindEditorApp(ctk.CTk):
         # Block the default character insertion into the Entry
         return "break"
 
+    def _finalize_sequence(self):
+        # Called when the multi-tap window expires; finish listening
+        self.sequence_after_id = None
+        self.sequence_parts = None
+        self.end_listening()
+
+    def _reset_sequence_timer(self):
+        try:
+            if self.sequence_after_id is not None:
+                self.after_cancel(self.sequence_after_id)
+        except Exception:
+            pass
+        self.sequence_after_id = None
+
+    # ---- Modifier Tracking ----
     def on_modifier_press(self, event):
-        keysym = getattr(event, "keysym", "")
-        if keysym in ("Shift_L", "Shift_R"):
+        keysym = getattr(event, "keysym", "") or ""
+        if "Shift" in keysym:
             self.active_mods.add("Shift")
-        elif keysym in ("Control_L", "Control_R"):
+        elif "Control" in keysym:
             self.active_mods.add("Ctrl")
-        elif keysym in ("Alt_L", "Alt_R", "Meta_L", "Meta_R"):
+        elif "Alt" in keysym or "Meta" in keysym:
             self.active_mods.add("Alt")
             self.saw_alt_press = True
-        return "break"
 
     def on_modifier_release(self, event):
-        keysym = getattr(event, "keysym", "")
-        # If user pressed only Alt (or Meta) and released it while listening, bind it as 'alt'
-        if self.listening_entry and keysym in ("Alt_L", "Alt_R", "Meta_L", "Meta_R"):
-            prior_mods = set(self.active_mods)
-            # If Alt was the only active modifier, treat as Alt-only bind
-            if prior_mods == {"Alt"} and self.saw_alt_press and not self.saw_any_nonmod_key:
-                entry = self.listening_entry
-                try:
-                    entry.delete(0, "end")
-                except Exception:
-                    pass
-                entry.insert(0, "Alt")
-                self.end_listening()
-                return "break"
-        if keysym in ("Shift_L", "Shift_R"):
+        keysym = getattr(event, "keysym", "") or ""
+        if "Shift" in keysym:
             self.active_mods.discard("Shift")
-        elif keysym in ("Control_L", "Control_R"):
+        elif "Control" in keysym:
             self.active_mods.discard("Ctrl")
-        elif keysym in ("Alt_L", "Alt_R", "Meta_L", "Meta_R"):
+        elif "Alt" in keysym or "Meta" in keysym:
             self.active_mods.discard("Alt")
-        return "break"
 
+    # ---- Key Event Formatting ----
     def format_key_event(self, event):
         """
         Convert a Tk key event into the game's key string.
@@ -434,24 +885,26 @@ class KeybindEditorApp(ctk.CTk):
     def save_keybinds(self):
         """Saves the current state of the UI back to the text file."""
         try:
+            # Ensure in-memory data matches any on-screen edits
+            self._sync_ui_to_data()
             with open(self.filename, "w") as f:
-                # Iterate through our original structured data
+                # 1) Start with a global clear so unbound rows actually unbind
+                f.write("unbindall\n")
+                # 2) Preserve all non-bind lines (comments, other commands) in original order
                 for item in self.keybind_data:
-                    if item["type"] == "bind":
-                        # If it's a bind, get the potentially modified key from the UI
-                        entry_widget = self.ui_widgets.get(item["id"])
-                        if entry_widget:
-                            new_key = entry_widget.get()
-                            # Reconstruct the line with nice formatting
-                            # The f-string formatting ensures columns align
-                            new_line = f"bind          {new_key:<15}  {item['action']}\n"
-                            f.write(new_line)
-                        else:
-                            # Fallback to original if something went wrong
-                            f.write(item["original"])
-                    else:
-                        # For all other line types, write the original line back
-                        f.write(item["original"])
+                    if item.get("type") != "bind" and item.get("original") is not None:
+                        line = item["original"]
+                        # Avoid duplicating unbindall if present in original
+                        if line.strip().lower().startswith("unbindall"):
+                            continue
+                        f.write(line)
+                # 3) Write current binds for all bound items
+                for item in self.keybind_data:
+                    if item.get("type") == "bind":
+                        new_key = (item.get("key") or "").strip()
+                        if new_key.lower() in ("", "unbound"):
+                            continue
+                        f.write(f"bind          {new_key:<15}  {item['action']}\n")
             
             messagebox.showinfo("Success", f"Keybinds saved to {self.filename}")
 

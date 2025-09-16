@@ -46,6 +46,7 @@ pip install -r requirements.txt
 ## Notes
 - The app will try to open the default game file at `C:\\Program Files\\Beyond-All-Reason\\data\\uikeys.txt`. If it’s missing, it prompts you to select a file.
 - Saving rewrites `bind` lines with aligned columns while preserving other lines (comments/commands) as-is.
+ - If an `original keys.txt` file is present next to `main.py`, its `bind` actions are treated as defaults. Any default action missing from your file is shown with key `unbound` in the UI. When you save, rows left as `unbound` are skipped (not written), keeping those actions unbound.
 
 ## Troubleshooting
 - Alt keeps binding by itself:
