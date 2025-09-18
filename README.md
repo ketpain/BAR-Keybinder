@@ -1,7 +1,7 @@
 # BAR Keybind Editor (Beyond All Reason)
 <img width="1092" height="750" alt="image" src="https://github.com/user-attachments/assets/8399a092-0471-4dda-8cc2-056537785230" />
 
-A simple, user-friendly tool to edit your Beyond All Reason keybinds (`uikeys.txt`). No config syntax needed — just double‑click and press keys.
+A simple, user-friendly tool to edit your Beyond All Reason keybinds (`uikeys.txt`). No config syntax needed — just double‑click a key from the key column.
 
 If you're missing commands, the program parses commands from the (default keys.txt) which is found _interal/defaults/default keys.txt - so just bind the commands and give it a throw away hotkey or use what you would want.
 
